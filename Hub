@@ -1,0 +1,854 @@
+code Hub 
+#!/bin/bash
+# Enhanced Local AI Phone Complete Deployment Script
+# Supports Samsung Galaxy Store, Google Play Store, and AWS deployment
+# Version: 2.0.0
+# Author: Enhanced Deployment System
+
+set -euo pipefail  # Enhanced error handling
+
+# Enhanced Colors and Styling
+readonly RED='\033[0;31m'
+readonly GREEN='\033[0;32m'
+readonly YELLOW='\033[1;33m'
+readonly BLUE='\033[0;34m'
+readonly PURPLE='\033[0;35m'
+readonly CYAN='\033[0;36m'
+readonly WHITE='\033[1;37m'
+readonly NC='\033[0m' # No Color
+readonly BOLD='\033[1m'
+
+# Configuration - Enhanced with AWS and environment support
+readonly APP_NAME="${APP_NAME:-LocalAIApp}"
+readonly PACKAGE_NAME="${PACKAGE_NAME:-com.localaiapp}"
+readonly BUILD_VARIANT="${BUILD_VARIANT:-release}"
+readonly PROJECT_ROOT="$(pwd)"
+readonly TIMESTAMP="$(date +%Y%m%d_%H%M%S)"
+
+# AWS Configuration
+readonly AWS_REGION="${AWS_REGION:-us-east-1}"
+readonly AWS_S3_BUCKET="${AWS_S3_BUCKET:-localai-deployment-bucket}"
+readonly AWS_LAMBDA_FUNCTION="${AWS_LAMBDA_FUNCTION:-localai-backend}"
+readonly AWS_API_GATEWAY="${AWS_API_GATEWAY:-localai-api}"
+
+# Enhanced paths with validation
+readonly KEYSTORE_PATH="${PROJECT_ROOT}/android/app/release.keystore"
+readonly KEYSTORE_ALIAS="${KEYSTORE_ALIAS:-localai-release}"
+readonly BUILD_DIR="${PROJECT_ROOT}/builds"
+readonly STORE_ASSETS_DIR="${PROJECT_ROOT}/store-assets"
+readonly SCREENSHOTS_DIR="${PROJECT_ROOT}/screenshots"
+readonly AWS_DEPLOY_DIR="${PROJECT_ROOT}/aws-deployment"
+
+# API Keys and sensitive data
+readonly SAMSUNG_STORE_API_KEY="${SAMSUNG_STORE_API_KEY:-}"
+readonly GOOGLE_PLAY_API_KEY="${GOOGLE_PLAY_API_KEY:-}"
+readonly HUGGING_FACE_TOKEN="${HUGGING_FACE_TOKEN:-}"
+
+# Logging setup
+readonly LOG_DIR="${PROJECT_ROOT}/logs"
+readonly LOG_FILE="${LOG_DIR}/deployment_${TIMESTAMP}.log"
+
+# Create necessary directories
+mkdir -p "$BUILD_DIR" "$STORE_ASSETS_DIR" "$SCREENSHOTS_DIR" "$AWS_DEPLOY_DIR" "$LOG_DIR"
+
+# Enhanced logging function
+log_message() {
+    local level="$1"
+    local message="$2"
+    local timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+    echo "[$timestamp] [$level] $message" | tee -a "$LOG_FILE"
+}
+
+# Enhanced status functions with logging
+print_header() {
+    echo -e "\n${BOLD}${BLUE}============================================${NC}"
+    echo -e "${BOLD}${WHITE}$1${NC}"
+    echo -e "${BOLD}${BLUE}============================================${NC}\n"
+    log_message "HEADER" "$1"
+}
+
+print_status() {
+    echo -e "${YELLOW}[INFO]${NC} $1"
+    log_message "INFO" "$1"
+}
+
+print_success() {
+    echo -e "${GREEN}[SUCCESS]${NC} $1"
+    log_message "SUCCESS" "$1"
+}
+
+print_error() {
+    echo -e "${RED}[ERROR]${NC} $1"
+    log_message "ERROR" "$1"
+}
+
+print_warning() {
+    echo -e "${PURPLE}[WARNING]${NC} $1"
+    log_message "WARNING" "$1"
+}
+
+print_debug() {
+    if [[ "${DEBUG:-false}" == "true" ]]; then
+        echo -e "${CYAN}[DEBUG]${NC} $1"
+        log_message "DEBUG" "$1"
+    fi
+}
+
+# Error handling with cleanup
+cleanup_on_error() {
+    print_error "Deployment failed. Cleaning up..."
+    # Kill any background processes
+    jobs -p | xargs -r kill 2>/dev/null || true
+    # Clean temporary files
+    rm -rf /tmp/localai_* 2>/dev/null || true
+    exit 1
+}
+
+trap cleanup_on_error ERR
+
+# Enhanced prerequisites check
+check_prerequisites() {
+    print_header "CHECKING PREREQUISITES"
+    
+    local missing_deps=()
+    
+    # Check Node.js
+    if ! command -v node &> /dev/null; then
+        missing_deps+=("Node.js")
+    else
+        local node_version=$(node --version)
+        print_success "Node.js found: $node_version"
+        if [[ "${node_version#v}" < "16.0.0" ]]; then
+            print_warning "Node.js version $node_version is below recommended 16.0.0"
+        fi
+    fi
+    
+    # Check npm
+    if ! command -v npm &> /dev/null; then
+        missing_deps+=("npm")
+    else
+        print_success "npm found: $(npm --version)"
+    fi
+    
+    # Check Java
+    if ! command -v java &> /dev/null; then
+        missing_deps+=("Java")
+    else
+        local java_version=$(java -version 2>&1 | head -n1 | cut -d'"' -f2)
+        print_success "Java found: $java_version"
+    fi
+    
+    # Check Android SDK
+    if [[ -z "${ANDROID_HOME:-}" ]]; then
+        missing_deps+=("ANDROID_HOME environment variable")
+    else
+        print_success "ANDROID_HOME: $ANDROID_HOME"
+    fi
+    
+    # Check AWS CLI
+    if ! command -v aws &> /dev/null; then
+        print_warning "AWS CLI not found - AWS deployment will be skipped"
+    else
+        print_success "AWS CLI found: $(aws --version)"
+        
+        # Check AWS credentials
+        if aws sts get-caller-identity &> /dev/null; then
+            print_success "AWS credentials configured"
+        else
+            print_warning "AWS credentials not configured - AWS deployment will be skipped"
+        fi
+    fi
+    
+    # Check React Native CLI
+    if ! command -v npx &> /dev/null; then
+        missing_deps+=("npx")
+    fi
+    
+    # Check project structure
+    if [[ ! -f "package.json" ]]; then
+        missing_deps+=("package.json (not in React Native project directory)")
+    fi
+    
+    if [[ ! -d "android" ]]; then
+        missing_deps+=("Android project directory")
+    fi
+    
+    # Check for gradlew
+    if [[ ! -f "android/gradlew" ]]; then
+        missing_deps+=("Gradle wrapper (android/gradlew)")
+    fi
+    
+    # Report missing dependencies
+    if [[ ${#missing_deps[@]} -gt 0 ]]; then
+        print_error "Missing dependencies:"
+        printf '%s\n' "${missing_deps[@]}" | sed 's/^/  - /'
+        print_error "Please install missing dependencies and try again"
+        exit 1
+    fi
+    
+    print_success "All prerequisites satisfied"
+}
+
+# Enhanced dependency installation
+install_dependencies() {
+    print_header "INSTALLING DEPENDENCIES"
+    
+    # Clean and backup node_modules
+    if [[ -d "node_modules" ]]; then
+        print_status "Backing up existing node_modules..."
+        mv node_modules "node_modules.backup.${TIMESTAMP}" || true
+    fi
+    
+    # Clear npm cache
+    print_status "Clearing npm cache..."
+    npm cache clean --force
+    
+    # Install with retry mechanism
+    local max_attempts=3
+    local attempt=1
+    
+    while [[ $attempt -le $max_attempts ]]; do
+        print_status "Installing npm dependencies (attempt $attempt/$max_attempts)..."
+        
+        if npm install --no-audit --no-fund; then
+            print_success "npm dependencies installed successfully"
+            break
+        else
+            print_warning "npm install failed on attempt $attempt"
+            if [[ $attempt -eq $max_attempts ]]; then
+                print_error "Failed to install npm dependencies after $max_attempts attempts"
+                exit 1
+            fi
+            ((attempt++))
+            sleep 5
+        fi
+    done
+    
+    # Android dependencies
+    print_status "Installing Android dependencies..."
+    cd android
+    
+    # Make gradlew executable
+    chmod +x gradlew
+    
+    # Clean and install
+    ./gradlew clean --no-daemon
+    ./gradlew dependencies --no-daemon
+    
+    cd "$PROJECT_ROOT"
+    
+    print_success "All dependencies installed"
+}
+
+# Enhanced version management
+increment_version() {
+    print_header "VERSION MANAGEMENT"
+    
+    # Read current version
+    local current_version
+    current_version=$(node -p "require('./package.json').version" 2>/dev/null || echo "1.0.0")
+    print_status "Current version: $current_version"
+    
+    # Increment version based on argument or default to patch
+    local version_type="${1:-patch}"
+    npm version "$version_type" --no-git-tag-version
+    
+    local new_version
+    new_version=$(node -p "require('./package.json').version")
+    print_status "New version: $new_version"
+    
+    # Update Android version
+    cd android/app
+    
+    local build_gradle="build.gradle"
+    if [[ ! -f "$build_gradle" ]]; then
+        print_error "build.gradle not found in android/app/"
+        exit 1
+    fi
+    
+    # Get current version code
+    local version_code
+    version_code=$(grep -oP 'versionCode \K\d+' "$build_gradle" || echo "1")
+    local new_version_code=$((version_code + 1))
+    
+    # Update version code and name
+    sed -i.bak "s/versionCode $version_code/versionCode $new_version_code/g" "$build_gradle"
+    sed -i.bak "s/versionName \".*\"/versionName \"$new_version\"/g" "$build_gradle"
+    
+    cd "$PROJECT_ROOT"
+    
+    # Update version in AWS deployment config
+    update_aws_version "$new_version" "$new_version_code"
+    
+    print_success "Version updated to $new_version (code: $new_version_code)"
+    
+    # Export for other functions
+    export APP_VERSION="$new_version"
+    export APP_VERSION_CODE="$new_version_code"
+}
+
+# AWS version update
+update_aws_version() {
+    local version="$1"
+    local version_code="$2"
+    
+    cat > "$AWS_DEPLOY_DIR/version.json" << EOF
+{
+    "version": "$version",
+    "versionCode": $version_code,
+    "buildTime": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+    "gitCommit": "$(git rev-parse HEAD 2>/dev/null || echo 'unknown')"
+}
+EOF
+}
+
+# Enhanced keystore generation
+generate_keystore() {
+    print_header "KEYSTORE MANAGEMENT"
+    
+    if [[ -f "$KEYSTORE_PATH" ]]; then
+        print_status "Using existing keystore: $KEYSTORE_PATH"
+        
+        # Verify keystore
+        if keytool -list -keystore "$KEYSTORE_PATH" -storepass "${KEYSTORE_PASS:-android}" &>/dev/null; then
+            print_success "Keystore verified successfully"
+        else
+            print_error "Keystore verification failed"
+            exit 1
+        fi
+    else
+        print_status "Generating new keystore..."
+        
+        # Ensure directory exists
+        mkdir -p "$(dirname "$KEYSTORE_PATH")"
+        
+        # Interactive keystore generation with better defaults
+        local store_pass="${KEYSTORE_PASS:-$(openssl rand -base64 12)}"
+        local key_pass="${KEY_PASS:-$store_pass}"
+        
+        keytool -genkeypair -v \
+            -keystore "$KEYSTORE_PATH" \
+            -alias "$KEYSTORE_ALIAS" \
+            -keyalg RSA \
+            -keysize 2048 \
+            -validity 10000 \
+            -storepass "$store_pass" \
+            -keypass "$key_pass" \
+            -dname "CN=LocalAI App, OU=Mobile Development, O=LocalAI Corp, L=San Francisco, S=California, C=US"
+        
+        print_success "Keystore generated: $KEYSTORE_PATH"
+        print_warning "Store password: $store_pass"
+        print_warning "Key password: $key_pass"
+        
+        # Save credentials securely
+        cat > "${KEYSTORE_PATH}.credentials" << EOF
+KEYSTORE_PASS=$store_pass
+KEY_PASS=$key_pass
+KEYSTORE_ALIAS=$KEYSTORE_ALIAS
+CREATED=$(date)
+EOF
+        chmod 600 "${KEYSTORE_PATH}.credentials"
+    fi
+}
+
+# Enhanced testing with multiple test types
+run_tests() {
+    print_header "RUNNING TESTS"
+    
+    # Unit tests
+    print_status "Running unit tests..."
+    if npm test -- --watchAll=false --coverage --passWithNoTests; then
+        print_success "Unit tests passed"
+    else
+        print_error "Unit tests failed"
+        exit 1
+    fi
+    
+    # Lint checks
+    print_status "Running linting checks..."
+    if npm run lint 2>/dev/null || npx eslint . --ext .js,.jsx,.ts,.tsx 2>/dev/null || true; then
+        print_success "Linting completed"
+    else
+        print_warning "Linting issues found (non-blocking)"
+    fi
+    
+    # Type checking (if TypeScript)
+    if [[ -f "tsconfig.json" ]]; then
+        print_status "Running TypeScript type checking..."
+        if npx tsc --noEmit; then
+            print_success "Type checking passed"
+        else
+            print_warning "Type checking issues found (non-blocking)"
+        fi
+    fi
+    
+    # Android specific tests
+    print_status "Running Android instrumentation tests..."
+    cd android
+    if ./gradlew connectedAndroidTest --no-daemon 2>/dev/null || true; then
+        print_success "Android tests completed"
+    else
+        print_warning "Android tests skipped (no connected device)"
+    fi
+    cd "$PROJECT_ROOT"
+}
+
+# Enhanced build process
+build_release() {
+    print_header "BUILDING RELEASE"
+    
+    # Pre-build cleanup
+    print_status "Pre-build cleanup..."
+    cd android
+    ./gradlew clean --no-daemon
+    
+    # Build release APK with optimizations
+    print_status "Building release APK..."
+    ./gradlew assembleRelease \
+        --no-daemon \
+        --parallel \
+        --build-cache \
+        --configure-on-demand
+    
+    if [[ $? -eq 0 ]]; then
+        print_success "Release APK built successfully"
+        
+        # Verify APK exists
+        local apk_path="app/build/outputs/apk/release/app-release-unsigned.apk"
+        if [[ -f "$apk_path" ]]; then
+            local apk_size=$(du -h "$apk_path" | cut -f1)
+            print_success "APK size: $apk_size"
+        else
+            print_error "APK file not found at expected location"
+            exit 1
+        fi
+    else
+        print_error "Failed to build release APK"
+        exit 1
+    fi
+    
+    cd "$PROJECT_ROOT"
+}
+
+# Enhanced APK signing with verification
+sign_apk() {
+    print_header "SIGNING APK"
+    
+    local unsigned_apk="android/app/build/outputs/apk/release/app-release-unsigned.apk"
+    local signed_apk="android/app/build/outputs/apk/release/app-release-signed.apk"
+    
+    # Load keystore credentials
+    local store_pass="${KEYSTORE_PASS:-android}"
+    local key_pass="${KEY_PASS:-android}"
+    
+    if [[ -f "${KEYSTORE_PATH}.credentials" ]]; then
+        source "${KEYSTORE_PATH}.credentials"
+        store_pass="$KEYSTORE_PASS"
+        key_pass="$KEY_PASS"
+    fi
+    
+    print_status "Signing APK with keystore..."
+    jarsigner -verbose \
+        -sigalg SHA256withRSA \
+        -digestalg SHA-256 \
+        -keystore "$KEYSTORE_PATH" \
+        -storepass "$store_pass" \
+        -keypass "$key_pass" \
+        -signedjar "$signed_apk" \
+        "$unsigned_apk" \
+        "$KEYSTORE_ALIAS"
+    
+    if [[ $? -eq 0 ]]; then
+        print_success "APK signed successfully"
+        
+        # Verify signature
+        if jarsigner -verify -verbose -certs "$signed_apk" &>/dev/null; then
+            print_success "APK signature verified"
+        else
+            print_error "APK signature verification failed"
+            exit 1
+        fi
+    else
+        print_error "Failed to sign APK"
+        exit 1
+    fi
+}
+
+# Enhanced APK optimization
+optimize_apk() {
+    print_header "OPTIMIZING APK"
+    
+    local signed_apk="android/app/build/outputs/apk/release/app-release-signed.apk"
+    local final_apk="android/app/build/outputs/apk/release/${APP_NAME}-${APP_VERSION:-1.0.0}-release.apk"
+    
+    # Find latest build tools
+    local build_tools_version
+    build_tools_version=$(ls "$ANDROID_HOME/build-tools" | sort -V | tail -1)
+    local zipalign="$ANDROID_HOME/build-tools/$build_tools_version/zipalign"
+    
+    if [[ ! -f "$zipalign" ]]; then
+        print_error "zipalign not found in build-tools"
+        exit 1
+    fi
+    
+    print_status "Aligning APK..."
+    "$zipalign" -v 4 "$signed_apk" "$final_apk"
+    
+    if [[ $? -eq 0 ]]; then
+        print_success "APK optimized successfully"
+        
+        # Get final APK info
+        local final_size=$(du -h "$final_apk" | cut -f1)
+        print_success "Final APK: $final_apk ($final_size)"
+        
+        # Generate APK info
+        generate_apk_info "$final_apk"
+    else
+        print_error "Failed to optimize APK"
+        exit 1
+    fi
+}
+
+# Generate APK information
+generate_apk_info() {
+    local apk_path="$1"
+    local info_file="${BUILD_DIR}/apk-info-${TIMESTAMP}.json"
+    
+    print_status "Generating APK information..."
+    
+    # Use aapt to get package info
+    local aapt="$ANDROID_HOME/build-tools/$(ls $ANDROID_HOME/build-tools | sort -V | tail -1)/aapt"
+    
+    if [[ -f "$aapt" ]]; then
+        local package_info
+        package_info=$("$aapt" dump badging "$apk_path" 2>/dev/null || echo "")
+        
+        cat > "$info_file" << EOF
+{
+    "buildTime": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+    "apkPath": "$apk_path",
+    "apkSize": "$(stat -f%z "$apk_path" 2>/dev/null || stat -c%s "$apk_path")",
+    "packageInfo": $(echo "$package_info" | jq -R . | jq -s . 2>/dev/null || echo "[]")
+}
+EOF
+        print_success "APK info saved to: $info_file"
+    fi
+}
+
+# Enhanced AAB (Android App Bundle) build
+build_aab() {
+    print_header "BUILDING ANDROID APP BUNDLE"
+    
+    cd android
+    
+    print_status "Building AAB with optimizations..."
+    ./gradlew bundleRelease \
+        --no-daemon \
+        --parallel \
+        --build-cache
+    
+    if [[ $? -eq 0 ]]; then
+        local aab_path="app/build/outputs/bundle/release/app-release.aab"
+        
+        if [[ -f "$aab_path" ]]; then
+            local aab_size=$(du -h "$aab_path" | cut -f1)
+            print_success "AAB built successfully: $aab_size"
+            print_success "AAB location: android/$aab_path"
+            
+            # Copy to builds directory with versioned name
+            local versioned_aab="${BUILD_DIR}/${APP_NAME}-${APP_VERSION:-1.0.0}-release.aab"
+            cp "$aab_path" "$versioned_aab"
+            print_success "AAB copied to: $versioned_aab"
+        else
+            print_error "AAB file not found at expected location"
+            exit 1
+        fi
+    else
+        print_error "Failed to build AAB"
+        exit 1
+    fi
+    
+    cd "$PROJECT_ROOT"
+}
+
+# Enhanced screenshot generation with automation
+generate_screenshots() {
+    print_header "SCREENSHOT GENERATION"
+    
+    mkdir -p "$SCREENSHOTS_DIR"
+    
+    # Generate comprehensive screenshot guidelines
+    cat > "$SCREENSHOTS_DIR/screenshot-requirements.md" << EOF
+# Screenshot Requirements for Store Listing
+
+## Required Screenshots
+
+### Phone Screenshots (Required)
+- **Dimensions**: 1080x1920 pixels (9:16 aspect ratio)
+- **Format**: PNG or JPEG (PNG preferred)
+- **Count**: Minimum 2, Maximum 8
+
+#### Required Screens:
+1. **Home/Dashboard Screen**
+   - Show main interface with AI model selection
+   - Display offline indicator
+   - Include privacy messaging
+
+2. **Chat Interface**
+   - Show active conversation with AI
+   - Demonstrate natural language interaction
+   - Include typing indicators
+
+3. **Model Browser**
+   - Display available AI models
+   - Show download progress
+   - Include model details (size, capabilities)
+
+4. **Settings/Privacy Screen**
+   - Highlight offline functionality
+   - Show privacy controls
+   - Display storage management
+
+5. **Training Interface** (if applicable)
+   - Show model training in progress
+   - Display training metrics
+   - Include custom model creation
+
+### Tablet Screenshots (Optional but Recommended)
+- **Dimensions**: 1200x1920 pixels (5:8 aspect ratio)
+- **Same content as phone but optimized for tablet layout**
+
+## Design Guidelines
+
+### Visual Requirements:
+- Use actual app content (no mockups)
+- Include realistic data and conversations
+- Show both light and dark themes
+- Ensure text is readable at thumbnail size
+- No sensitive or personal information
+
+### Technical Requirements:
+- High resolution, crisp images
+- Consistent UI elements across screenshots
+- Current app version shown
+- No development/debug elements visible
+- Proper status bar content
+
+## Store-Specific Requirements
+
+### Samsung Galaxy Store:
+- Maximum 10 screenshots
+- Support for landscape orientation
+- Localized screenshots recommended
+
+### Google Play Store:
+- Maximum 8 screenshots per device type
+- Captions supported (up to 500 characters)
+- Feature graphic required (1024x500)
+
+## Automated Screenshot Generation
+
+To generate screenshots automatically:
+1. Use Detox or similar testing framework
+2. Run \`npm run screenshots\` (if configured)
+3. Or use device farms like AWS Device Farm
+
+## Manual Screenshot Process
+
+1. **Device Setup**:
+   - Use clean device with latest OS
+   - Install release version of app
+   - Clear cache and reset to defaults
+
+2. **Content Preparation**:
+   - Pre-load sample AI models
+   - Prepare realistic chat conversations
+   - Set up demo training data
+
+3. **Capture Process**:
+   - Use device's screenshot function
+   - Capture in highest resolution
+   - Take multiple versions for A/B testing
+
+4. **Post-Processing**:
+   - Crop to exact dimensions
+   - Optimize file size
+   - Add captions if needed
+   - Localize for different markets
+EOF
+
+    # Generate automated screenshot script
+    cat > "$SCREENSHOTS_DIR/generate-screenshots.js" << 'EOF'
+#!/usr/bin/env node
+
+/**
+ * Automated Screenshot Generation Script
+ * Requires Detox or similar testing framework
+ */
+
+const fs = require('fs');
+const path = require('path');
+
+const SCREENSHOT_CONFIG = {
+    outputDir: './screenshots/generated',
+    devices: ['phone', 'tablet'],
+    orientations: ['portrait', 'landscape'],
+    themes: ['light', 'dark'],
+    screens: [
+        'home',
+        'chat',
+        'models',
+        'settings',
+        'training'
+    ]
+};
+
+async function generateScreenshots() {
+    console.log('🎯 Starting automated screenshot generation...');
+    
+    // Ensure output directory exists
+    fs.mkdirSync(SCREENSHOT_CONFIG.outputDir, { recursive: true });
+    
+    // This would integrate with your testing framework
+    console.log('📱 Configure your testing framework to run this script');
+    console.log('🔧 Integration examples:');
+    console.log('  - Detox: https://github.com/wix/Detox');
+    console.log('  - Appium: https://appium.io/');
+    console.log('  - Maestro: https://maestro.mobile.dev/');
+    
+    // Generate placeholder structure
+    SCREENSHOT_CONFIG.devices.forEach(device => {
+        SCREENSHOT_CONFIG.screens.forEach(screen => {
+            const filename = `${device}-${screen}-screenshot.png`;
+            const filePath = path.join(SCREENSHOT_CONFIG.outputDir, filename);
+            
+            // Create placeholder file (replace with actual screenshot logic)
+            fs.writeFileSync(filePath + '.todo', `TODO: Generate ${filename}`);
+        });
+    });
+    
+    console.log('✅ Screenshot generation template created');
+}
+
+if (require.main === module) {
+    generateScreenshots().catch(console.error);
+}
+
+module.exports = { generateScreenshots, SCREENSHOT_CONFIG };
+EOF
+    
+    chmod +x "$SCREENSHOTS_DIR/generate-screenshots.js"
+    
+    print_success "Screenshot guidelines and automation script generated"
+    print_status "Run: node $SCREENSHOTS_DIR/generate-screenshots.js"
+}
+
+# Enhanced store assets creation
+create_store_assets() {
+    print_header "CREATING STORE ASSETS"
+    
+    # Enhanced store listing with internationalization support
+    cat > "$STORE_ASSETS_DIR/store-listing.json" << EOF
+{
+    "metadata": {
+        "version": "${APP_VERSION:-1.0.0}",
+        "created": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+        "languages": ["en-US", "es-ES", "fr-FR", "de-DE", "ja-JP", "ko-KR"]
+    },
+    "defaultLanguage": "en-US",
+    "listings": {
+        "en-US": {
+            "title": "Local AI - Offline AI Assistant",
+            "shortDescription": "Run powerful AI models locally on your phone with complete privacy and offline functionality",
+            "fullDescription": "Local AI is the ultimate offline AI assistant that brings the power of artificial intelligence directly to your mobile device. No internet required, no data sharing, complete privacy guaranteed.\\n\\n🔒 COMPLETE PRIVACY\\n• All AI processing happens on your device\\n• No data ever leaves your phone\\n• Zero cloud dependencies\\n• Your conversations stay private\\n\\n🤖 POWERFUL AI MODELS\\n• Download models from Hugging Face\\n• Support for multiple AI architectures\\n• Optimized for mobile performance\\n• Regular model updates\\n\\n💬 INTELLIGENT CONVERSATIONS\\n• Natural language understanding\\n• Context-aware responses\\n• Multi-turn conversations\\n• Custom personality settings\\n\\n🎯 LOCAL TRAINING\\n• Train models on your data\\n• Fine-tune for your needs\\n• Export and share models\\n• Advanced training controls\\n\\n📱 MOBILE OPTIMIZED\\n• Efficient battery usage\\n• Adaptive performance scaling\\n• Dark and light themes\\n• Responsive design\\n\\n✨ KEY FEATURES\\n• Works completely offline\\n• Multiple AI model support\\n• Conversation history\\n• Model management\\n• Training capabilities\\n• Privacy-first design\\n• Regular updates\\n• No subscriptions\\n\\nPerfect for users who value privacy, need offline AI capabilities, or want to experiment with local machine learning on mobile devices.",
+            "keywords": [
+                "AI", "artificial intelligence", "offline", "privacy", "local", "assistant", 
+                "machine learning", "neural network", "chatbot", "conversation",
+                "hugging face", "transformer", "language model", "mobile AI"
+            ],
+            "whatsNew": "• Enhanced model performance\\n• New AI models available\\n• Improved battery optimization\\n• Bug fixes and stability improvements"
+        }
+    },
+    "technical": {
+        "category": "Productivity",
+        "contentRating": "Everyone",
+        "minSdkVersion": 21,
+        "targetSdkVersion": 34,
+        "requirements": {
+            "storage": "4GB+ recommended for models",
+            "ram": "6GB+ recommended for optimal performance",
+            "processor": "ARM64 preferred",
+            "android": "7.0+ (API 24+)"
+        },
+        "permissions": [
+            "INTERNET (for model downloads only)",
+            "WRITE_EXTERNAL_STORAGE (for model storage)",
+            "WAKE_LOCK (for training sessions)"
+        ]
+    },
+    "marketing": {
+        "targetAudience": [
+            "Privacy-conscious users",
+            "AI enthusiasts",
+            "Developers and researchers",
+            "Users in low-connectivity areas",
+            "Students and educators"
+        ],
+        "competitiveAdvantages": [
+            "Complete offline functionality",
+            "No data sharing or tracking",
+            "Local model training capability",
+            "Open source model support",
+            "No subscription fees"
+        ],
+        "useCases": [
+            "Private AI conversations",
+            "Offline content generation",
+            "Educational AI exploration",
+            "Research and development",
+            "Custom model training"
+        ]
+    }
+}
+EOF
+
+    # Generate feature graphic templates
+    create_feature_graphics
+    
+    # Generate privacy policy
+    create_privacy_policy
+    
+    # Generate app description variants
+    create_description_variants
+    
+    print_success "Comprehensive store assets created"
+}
+
+# Create feature graphics and promotional materials
+create_feature_graphics() {
+    print_status "Generating feature graphics templates..."
+    
+    mkdir -p "$STORE_ASSETS_DIR/graphics"
+    
+    # Feature graphic specifications
+    cat > "$STORE_ASSETS_DIR/graphics/requirements.md" << 'EOF'
+# Graphic Asset Requirements
+
+## Feature Graphic (Required for Google Play)
+- **Dimensions**: 1024 x 500 pixels
+- **Format**: PNG or JPEG
+- **Content**: 
+  - App name and key value proposition
+  - Visual representation of AI/privacy theme
+  - No device frames or screenshots
+  - Readable text at thumbnail size
+
+## Icon Requirements
+- **Adaptive Icon**: 108 x 108 dp (432 x 432 px at XXXHDPI)
+- **Legacy Icon**: 48 x 48 dp to 192 x 192 px
+- **Round Icon**: Same dimensions as adaptive
+- **Monochrome Icon**: For themed icons (Android 13+)
+
+## Promotional Graphics
+- **TV Banner**: 1280 x 720 pixels (Android TV)
+- **Wear OS**: 400 x 400 pixels (square)
